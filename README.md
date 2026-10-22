@@ -61,18 +61,18 @@ Open your terminal and run:
 ```bash
 brew install python3 gtk+3 pygobject3
 ```
-Download `bakaflow_zoom.py` and run:
+Download `bakaflow.py` and run:
 ```bash
-python3 bakaflow_zoom.py
+python3 bakaflow.py
 ```
 
 ### 🪟 Windows
 Windows does not have Python or GTK installed by default.
 1. Install [Python](https://www.python.org/downloads/) (Make sure to check **"Add Python to PATH"**).
 2. Install GTK3 for Windows (via [MSYS2](https://www.msys2.org/)).
-3. Download `bakaflow_zoom.py` and run it in Command Prompt:
+3. Download `bakaflow.py` and run it in Command Prompt:
 ```cmd
-python bakaflow_zoom.py
+python bakaflow.py
 ```
 
 ## 🚀 Quick Start Guide
