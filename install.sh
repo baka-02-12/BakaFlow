@@ -12,14 +12,14 @@ mkdir -p ~/.local/share/applications
 
 # Download the python file directly from your GitHub
 echo "Downloading BakaFlow script..."
-curl -sL https://raw.githubusercontent.com/baka-02-12/BakaFlow/main/bakaflow_zoom.py -o ~/.local/share/bakaflow/bakaflow_zoom.py
+curl -sL https://raw.githubusercontent.com/baka-02-12/BakaFlow/main/bakaflow.py -o ~/.local/share/bakaflow/bakaflow.py
 
 # Create menu shortcut
 cat > ~/.local/share/applications/bakaflow.desktop << EOF
 [Desktop Entry]
 Type=Application
 Name=BakaFlow
-Exec=python3 $HOME/.local/share/bakaflow/bakaflow_zoom.py
+Exec=python3 $HOME/.local/share/bakaflow/bakaflow.py
 Icon=applications-graphics
 Terminal=false
 EOF
