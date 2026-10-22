@@ -62,17 +62,3 @@ You can install BakaFlow with a single terminal command.
 Open your terminal and paste this:
 ```bash
 curl -sL https://raw.githubusercontent.com/baka-02-12/BakaFlow/main/install.sh | bash
-(Note: It will ask for your password to install the required GTK dependencies).
-
-Once it finishes, simply search for BakaFlow in your application menu to open it!
-
-🚀 Quick Start Guide
-Open BakaFlow and click "Launch EffectCraft".
-
-Select the keyframes you want to edit in EffectCraft.
-
-In BakaFlow, drag the handles to shape your curve (or pick a preset).
-
-Choose which axes you want to apply it to.
-
-Click APPLY EASING.
