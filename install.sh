@@ -25,4 +25,7 @@ Terminal=false
 EOF
 chmod +x ~/.local/share/applications/bakaflow.desktop
 
+# Refresh menu
+update-desktop-database ~/.local/share/applications 2>/dev/null
+
 echo "✅ Done! BakaFlow is now in your app menu."
