@@ -62,3 +62,25 @@ You can install BakaFlow with a single terminal command.
 Open your terminal and paste this:
 ```bash
 curl -sL https://raw.githubusercontent.com/baka-02-12/BakaFlow/main/install.sh | bash
+
+### 🍎 macOS
+macOS does not have GTK installed by default. You will need [Homebrew](https://brew.sh/). 
+Open your terminal and run:
+```bash
+brew install python3 gtk+3 pygobject3
+Download bakaflow_zoom.py and run:
+
+bash
+python3 bakaflow_zoom.py
+
+### 🪟 Windows
+Windows does not have Python or GTK installed by default.
+
+Install Python (Make sure to check "Add Python to PATH").
+
+Install GTK3 for Windows (via MSYS2).
+
+Download bakaflow_zoom.py and run it in Command Prompt:
+
+cmd
+python bakaflow_zoom.py
