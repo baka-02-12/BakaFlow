@@ -2,7 +2,7 @@
 
 A lightweight, modern Easing Curve Editor for **EffectCraft**. 
 
-BakaFlow lets you visually design cubic-bezier easing curves, preview them in real-time, and instantly apply them to your keyframes.
+BakaFlow lets you visually design cubic-bezier easing curves, preview them in real-time, and instantly apply them to your keyframes. It features a dual-graph system, allowing you to switch between **Value** (position) and **Speed** (velocity) graphs.
 
 ## ⚠️ Important: How to Start
 For BakaFlow to communicate with EffectCraft, **you must launch EffectCraft from BakaFlow first.**
@@ -14,15 +14,27 @@ For BakaFlow to communicate with EffectCraft, **you must launch EffectCraft from
 *(If you open EffectCraft normally without BakaFlow, the app won't connect and the status bar will say "No EC connection").*
 
 ## ✨ Features
-- **Live Preview:** See exactly how your animation will feel with the built-in playback tool before applying it.
-- **28 Built-in Presets:** Includes standard easings like Linear, Sine, Quad, Cubic, Expo, Circ, and Back.
-- **Custom Presets:** Save your own curves and use them later.
-- **Import / Export:** Share your custom curves with friends via JSON files.
+
+### 📊 Dual Graph System
+- **Value Graph:** Control the visual position curve. Features standard draggable handles (Blue for Out, Orange for In).
+- **Speed Graph:** Control the velocity (derivative) curve. Perfect for creating snappy physics, impacts, and smooth motion.
+- **Auto-Sync:** Changes made in the Value Graph instantly update the Speed Graph (and vice versa) using precise mathematical derivatives.
+
+### 🎬 Professional Animation Tools
+- **Interactive Playhead:** Click and drag anywhere on the graph to scrub through the animation and see live speed readings at any frame.
+- **Play/Pause Preview:** Built-in animation preview with smooth 60fps playback.
+- **Speed Presets:** Includes exclusive velocity-based presets like *Whip (Fast Start)*, *Slam (Fast End)*, *Hit Stop*, and *Elastic Bounce*.
+- **28 Standard Presets:** Includes Linear, Sine, Quad, Cubic, Expo, Circ, and Back.
 - **Axis Control:** Apply easing to specific axes (X, Y, Z) without messing up the others.
+
+### ⚙️ Interface & Workflow
+- **Advanced Controls:** Lock handles to the graph bounds, snap to grid (0.1), and Mirror mode for symmetric easing.
+- **Custom Presets:** Save your own curves, import/export them as JSON files, and share them with others.
+- **Scalable UI:** Built-in UI zoom (+ / -) and "Keep on Top" toggle.
 - **Built-in Dark Mode:** A clean, Tokyo Night-inspired UI.
 
 ## 🎯 How the X / Y / Z Checkboxes Work
-The axis checkboxes at the bottom let you control exactly what gets affected. 
+The axis checkboxes let you control exactly what gets affected. 
 
 - **All three checked (X, Y, Z):** Applies the curve directly to the property in place. **No separation.** (Perfect for 2D layers or when you want one curve for everything).
 - **Partial (e.g., X and Y only):** BakaFlow will **separate** the vector dimensions in EffectCraft, and apply the curve *only* to the checked axes.
@@ -78,6 +90,7 @@ python bakaflow.py
 ## 🚀 Quick Start Guide
 1. Open **BakaFlow** and click **"Launch EffectCraft"**.
 2. Select the keyframes you want to edit in EffectCraft.
-3. In BakaFlow, drag the handles to shape your curve (or pick a preset).
-4. Choose which axes you want to apply it to.
-5. Click **APPLY EASING**.
+3. Choose your tab: **Value** (position) or **Speed** (velocity).
+4. Drag the handles to shape your curve (or pick a preset).
+5. Choose which axes you want to apply it to.
+6. Click **APPLY VALUE** or **APPLY SPEED**.
