@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk, GLib
+from gi.repository import Gtk, Gdk, GLib, Pango
 import cairo
 import math
 import json
@@ -82,6 +82,129 @@ BUILTIN_PRESETS = {
 CONFIG_DIR = os.path.expanduser("~/.config/bakaflow")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "custom_presets.json")
 
+# <<SPEED_MATH_BEGIN>>
+MIN_INFL = 0.001
+
+def _bz(u, p1, p2):
+    return 3 * (1 - u) ** 2 * u * p1 + 3 * (1 - u) * u ** 2 * p2 + u ** 3
+
+def _bz_d(u, p1, p2):
+    return 3 * ((1 - u) ** 2 * p1 + 2 * (1 - u) * u * (p2 - p1) + u ** 2 * (1 - p2))
+
+def solve_u(x, x1, x2):
+    if x <= 0.0: return 0.0
+    if x >= 1.0: return 1.0
+    lo, hi = 0.0, 1.0
+    for _ in range(40):
+        mid = (lo + hi) / 2.0
+        if _bz(mid, x1, x2) < x: lo = mid
+        else: hi = mid
+    return (lo + hi) / 2.0
+
+def speed_at_u(u, x1, y1, x2, y2):
+    u = min(max(u, 1e-6), 1 - 1e-6)
+    dx = _bz_d(u, x1, x2)
+    if abs(dx) < 1e-12: return 0.0
+    return _bz_d(u, y1, y2) / dx
+
+def speed_at_time(t, x1, y1, x2, y2):
+    return speed_at_u(solve_u(t, x1, x2), x1, y1, x2, y2)
+
+def speed_curve(x1, y1, x2, y2, n=96):
+    pts = []
+    for k in range(n + 1):
+        u = 0.5 - 0.5 * math.cos(math.pi * k / n)
+        pts.append((_bz(u, x1, x2), speed_at_u(u, x1, y1, x2, y2)))
+    return pts
+
+def curve_extent(x1, y1, x2, y2, n=100):
+    ys = [_bz(k / n, y1, y2) for k in range(n + 1)]
+    return min(ys), max(ys)
+
+def bezier_to_speed(x1, y1, x2, y2):
+    i0 = max(MIN_INFL, x1)
+    i1 = max(MIN_INFL, 1.0 - x2)
+    if x1 < MIN_INFL and abs(y1) < 1e-9:
+        s0 = y2 / x2 if x2 > MIN_INFL else 0.0
+    else:
+        s0 = y1 / i0
+    if (1.0 - x2) < MIN_INFL and abs(1.0 - y2) < 1e-9:
+        s1 = (1.0 - y1) / (1.0 - x1) if (1.0 - x1) > MIN_INFL else 0.0
+    else:
+        s1 = (1.0 - y2) / i1
+    return s0, i0, s1, i1
+
+def speed_to_bezier(s0, i0, s1, i1):
+    return (i0, s0 * i0, 1.0 - i1, 1.0 - s1 * i1)
+
+def nice_step(span, target=4):
+    raw = max(span, 1e-9) / target
+    mag = 10 ** math.floor(math.log10(raw))
+    for m in (1, 2, 2.5, 5, 10):
+        if raw <= m * mag: return m * mag
+    return 10 * mag
+
+def fmt_num(v):
+    return f"{v:.2f}".rstrip("0").rstrip(".") if abs(v) < 1000 else f"{v:.0f}"
+# <<SPEED_MATH_END>>
+
+SPEED_PRESETS = {
+    "Constant Speed": speed_to_bezier(1.0, 1.0, 1.0, 1.0),
+    "Acceleration": speed_to_bezier(0.0, 0.8, 2.5, 0.8),
+    "Deceleration": speed_to_bezier(2.5, 0.8, 0.0, 0.8),
+    "Smooth Bell": speed_to_bezier(0.0, 0.5, 0.0, 0.5),
+    "Whip (Fast Start)": speed_to_bezier(8.0, 0.05, 0.0, 0.9),
+    "Slam (Fast End)": speed_to_bezier(0.0, 0.9, 8.0, 0.05),
+    "Hit Stop": speed_to_bezier(3.0, 0.15, 3.0, 0.15),
+    "Elastic Bounce": speed_to_bezier(2.0, 0.5, -1.5, 0.5),
+}
+
+class SpeedPresetRow(Gtk.ListBoxRow):
+    def __init__(self, name, bez):
+        super().__init__()
+        self.preset_name = name
+        self.bez = tuple(bez)
+        self.pts = speed_curve(*self.bez, n=28)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        box.set_margin_start(3); box.set_margin_end(3)
+        box.set_margin_top(1); box.set_margin_bottom(1)
+
+        self.draw_area = Gtk.DrawingArea()
+        self.draw_area.set_size_request(22, 17)
+        self.draw_area.connect("draw", self.on_draw_mini)
+        box.pack_start(self.draw_area, False, False, 0)
+
+        self.label = Gtk.Label(label=name)
+        self.label.set_xalign(0)
+        box.pack_start(self.label, True, True, 0)
+        self.add(box)
+        self.get_style_context().add_class("preset-row")
+
+    def on_draw_mini(self, widget, cr):
+        w = widget.get_allocated_width(); h = widget.get_allocated_height()
+        pad = 2
+        ss = [s for _, s in self.pts]
+        top = max(1.0, min(max(ss), 8.0))
+        bot = max(min(min(ss), 0.0), -3.0)
+        span = top - bot
+        def P(t, s):
+            s = min(max(s, bot), top)
+            return pad + t * (w - 2 * pad), pad + (top - s) / span * (h - 2 * pad)
+
+        rgb = (0.1, 0.1, 0.12) if self.is_selected() else (0.48, 0.64, 0.97)
+        _, y0 = P(0, 0)
+        x, y = P(*self.pts[0])
+        cr.move_to(x, y0)
+        for t, s in self.pts:
+            x, y = P(t, s); cr.line_to(x, y)
+        cr.line_to(P(1, 0)[0], y0); cr.close_path()
+        cr.set_source_rgba(rgb[0], rgb[1], rgb[2], 0.25); cr.fill()
+        cr.set_line_width(1.2); cr.set_source_rgba(rgb[0], rgb[1], rgb[2], 1.0)
+        x, y = P(*self.pts[0]); cr.move_to(x, y)
+        for t, s in self.pts[1:]:
+            x, y = P(t, s); cr.line_to(x, y)
+        cr.stroke()
+
 class PresetRow(Gtk.ListBoxRow):
     def __init__(self, name, x1, y1, x2, y2):
         super().__init__()
@@ -89,16 +212,13 @@ class PresetRow(Gtk.ListBoxRow):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
         box.set_margin_start(3); box.set_margin_end(3)
         box.set_margin_top(1); box.set_margin_bottom(1)
-
         self.draw_area = Gtk.DrawingArea()
         self.draw_area.set_size_request(17, 17)
         self.draw_area.connect("draw", self.on_draw_mini, x1, y1, x2, y2)
         box.pack_start(self.draw_area, False, False, 0)
-
         self.label = Gtk.Label(label=name)
         self.label.set_xalign(0)
         box.pack_start(self.label, True, True, 0)
-
         self.add(box)
         self.get_style_context().add_class("preset-row")
 
@@ -108,19 +228,16 @@ class PresetRow(Gtk.ListBoxRow):
         if self.is_selected(): cr.set_source_rgba(0.1, 0.1, 0.12, 1.0)
         else: cr.set_source_rgba(0.48, 0.64, 0.97, 1.0)
         cr.set_line_width(1.2)
-
         def to_px(x, y):
             return pad + x * (width - 2*pad), height - pad - y * (height - 2*pad)
-
         x0, y0 = to_px(0, 0); x1_p, y1_p = to_px(x1, y1)
         x2_p, y2_p = to_px(x2, y2); x3, y3 = to_px(1, 1)
-
         cr.move_to(x0, y0); cr.curve_to(x1_p, y1_p, x2_p, y2_p, x3, y3); cr.stroke()
 
 class BakaFlow(Gtk.Window):
     def __init__(self):
         super().__init__(title="BakaFlow")
-        self.set_default_size(425, 385)
+        self.set_default_size(450, 440)
         self.set_resizable(True)
         self.set_keep_above(True)
 
@@ -143,6 +260,12 @@ class BakaFlow(Gtk.Window):
         self.anim_source_id = None
         self.is_animating = False
 
+        self.last_graph_tab = "easing"
+        self.dragging_speed_handle = None
+        self.is_scrubbing = False
+        self.s_ymin, self.s_ymax = -0.1, 2.0
+        self.s_ml, self.s_mr, self.s_mt, self.s_mb = 30, 10, 8, 10
+
         self.load_custom_presets()
         self.ui_scale = 1.0
         self._css_provider = Gtk.CssProvider()
@@ -159,7 +282,7 @@ class BakaFlow(Gtk.Window):
         top_bar.pack_start(logo, False, False, 0)
 
         self.tab_buttons = {}
-        tabs = [("Easing", "easing", True), ("Presets", "presets", False), ("Manage", "manage", False), ("Import/Export", "import", False)]
+        tabs = [("Value", "easing", True), ("Speed", "speed", False), ("Presets", "presets", False), ("Manage", "manage", False), ("Import/Export", "import", False)]
         for label, page_name, is_active in tabs:
             btn = Gtk.Button(label=label)
             btn.get_style_context().add_class("tab-btn")
@@ -193,7 +316,6 @@ class BakaFlow(Gtk.Window):
 
         # EASING PAGE
         easing_page = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-
         left_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         left_box.set_margin_top(4); left_box.set_margin_bottom(4)
         left_box.set_margin_start(4); left_box.set_margin_end(4)
@@ -209,9 +331,7 @@ class BakaFlow(Gtk.Window):
         self.graph_area.connect("scroll-event", self.on_scroll)
         left_box.pack_start(self.graph_area, True, True, 0)
 
-        # ANIMATION PREVIEW & DURATION
         preview_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
-
         self.preview_area = Gtk.DrawingArea()
         self.preview_area.get_style_context().add_class("preview-bg")
         self.preview_area.set_size_request(-1, 18)
@@ -221,21 +341,20 @@ class BakaFlow(Gtk.Window):
         duration_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
         duration_lbl = Gtk.Label(label="Sec:")
         duration_lbl.get_style_context().add_class("status-text")
-        self.duration_spin = Gtk.SpinButton.new_with_range(0.5, 10.0, 0.5)
-        self.duration_spin.set_value(1.0)
+        self.duration_adj = Gtk.Adjustment(value=1.0, lower=0.5, upper=10.0, step_increment=0.5, page_increment=1.0, page_size=0.0)
+        self.duration_spin = Gtk.SpinButton(adjustment=self.duration_adj, climb_rate=1.0, digits=1)
         self.duration_spin.set_width_chars(2)
         duration_box.pack_start(duration_lbl, False, False, 0)
         duration_box.pack_start(self.duration_spin, False, False, 0)
         preview_box.pack_start(duration_box, False, False, 0)
 
-        play_btn = Gtk.Button(label="▶")
-        play_btn.get_style_context().add_class("btn-secondary")
-        play_btn.connect("clicked", self.on_play_preview)
-        preview_box.pack_start(play_btn, False, False, 0)
+        self.val_play_btn = Gtk.Button(label="▶")
+        self.val_play_btn.get_style_context().add_class("btn-secondary")
+        self.val_play_btn.connect("clicked", self.on_play_pause)
+        preview_box.pack_start(self.val_play_btn, False, False, 0)
 
         left_box.pack_start(preview_box, False, False, 0)
 
-        # INPUTS
         inputs_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
         self.entries = {}
         for key, val in [("x1", self.curve_x1), ("y1", self.curve_y1), ("x2", self.curve_x2), ("y2", self.curve_y2)]:
@@ -263,7 +382,6 @@ class BakaFlow(Gtk.Window):
         check_box.pack_start(self.snap_grid_check, False, False, 0)
         left_box.pack_start(check_box, False, False, 0)
 
-        # AXIS CHECKBOXES
         axis_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
         axis_lbl = Gtk.Label(label="Apply to Axes:")
         axis_lbl.get_style_context().add_class("status-text")
@@ -291,7 +409,6 @@ class BakaFlow(Gtk.Window):
 
         easing_page.pack1(left_box, True, False)
 
-        # RIGHT SIDE
         right_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.search_entry = Gtk.SearchEntry()
         self.search_entry.set_margin_top(4); self.search_entry.set_margin_bottom(4)
@@ -310,6 +427,7 @@ class BakaFlow(Gtk.Window):
         right_box.pack_start(scroll, True, True, 0)
         easing_page.pack2(right_box, True, False)
         self.stack.add_named(easing_page, "easing")
+        self.stack.add_named(self.build_speed_page(), "speed")
 
         # OTHER PAGES
         presets_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -365,7 +483,7 @@ class BakaFlow(Gtk.Window):
         self.status_label.set_xalign(0); self.status_label.get_style_context().add_class("status-text")
         bottom_bar.pack_start(self.status_label, False, False, 0)
 
-        btn_apply = Gtk.Button(label="APPLY EASING")
+        btn_apply = self.btn_apply = Gtk.Button(label="APPLY VALUE")
         btn_apply.get_style_context().add_class("btn-apply")
         btn_apply.connect("clicked", self.on_apply_clicked)
         bottom_bar.pack_end(btn_apply, False, False, 0)
@@ -378,6 +496,10 @@ class BakaFlow(Gtk.Window):
         btn_save.connect("clicked", self.on_save_preset_clicked)
         bottom_bar.pack_end(btn_save, False, False, 0)
         main_box.pack_start(bottom_bar, False, False, 0)
+
+        self.update_entries()
+        self.fit_speed_view()
+        self.update_speed_info()
 
     def _apply_style(self):
         css = _make_css(self.ui_scale)
@@ -415,13 +537,39 @@ class BakaFlow(Gtk.Window):
         t = (lo + hi) / 2.0
         return 3*(1-t)**2 * t * self.curve_y1 + 3*(1-t) * t**2 * self.curve_y2 + t**3
 
-    def on_play_preview(self, button):
-        if self.anim_source_id:
-            GLib.source_remove(self.anim_source_id)
-        self.anim_progress = 0.0
-        self.anim_eased_value = 0.0
-        self.is_animating = True
-        self.anim_source_id = GLib.timeout_add(16, self.update_animation)
+    def set_progress(self, t):
+        if self.is_animating:
+            self.is_animating = False
+            if self.anim_source_id:
+                GLib.source_remove(self.anim_source_id)
+                self.anim_source_id = None
+            if hasattr(self, "val_play_btn"): self.val_play_btn.set_label("▶")
+            if hasattr(self, "speed_play_btn"): self.speed_play_btn.set_label("▶")
+        self.anim_progress = max(0.0, min(1.0, t))
+        self.anim_eased_value = self.solve_bezier(self.anim_progress)
+        self.update_speed_info()
+        self._queue_all()
+
+    def on_play_pause(self, button):
+        if self.is_animating:
+            # Pause the animation
+            self.is_animating = False
+            if self.anim_source_id:
+                GLib.source_remove(self.anim_source_id)
+                self.anim_source_id = None
+            if hasattr(self, "val_play_btn"): self.val_play_btn.set_label("▶")
+            if hasattr(self, "speed_play_btn"): self.speed_play_btn.set_label("▶")
+        else:
+            # Resume or start from 0
+            if self.anim_progress >= 1.0:
+                self.anim_progress = 0.0
+                self.anim_eased_value = 0.0
+            self.is_animating = True
+            if hasattr(self, "val_play_btn"): self.val_play_btn.set_label("⏸")
+            if hasattr(self, "speed_play_btn"): self.speed_play_btn.set_label("⏸")
+            if self.anim_source_id:
+                GLib.source_remove(self.anim_source_id)
+            self.anim_source_id = GLib.timeout_add(16, self.update_animation)
 
     def update_animation(self):
         if not self.is_animating:
@@ -436,13 +584,15 @@ class BakaFlow(Gtk.Window):
             self.anim_eased_value = 1.0
             self.is_animating = False
             self.anim_source_id = None
-            self.preview_area.queue_draw()
-            self.graph_area.queue_draw()
+            if hasattr(self, "val_play_btn"): self.val_play_btn.set_label("▶")
+            if hasattr(self, "speed_play_btn"): self.speed_play_btn.set_label("▶")
+            self.update_speed_info()
+            self._queue_all()
             return False
 
         self.anim_eased_value = self.solve_bezier(self.anim_progress)
-        self.preview_area.queue_draw()
-        self.graph_area.queue_draw()
+        self.update_speed_info()
+        self._queue_all()
         return True
 
     def on_draw_preview(self, widget, cr):
@@ -474,22 +624,34 @@ class BakaFlow(Gtk.Window):
         cx1, cy1 = self.math_to_cairo(self.curve_x1, self.curve_y1, width, height)
         cx2, cy2 = self.math_to_cairo(self.curve_x2, self.curve_y2, width, height)
 
-        cr.set_source_rgba(0.34, 0.37, 0.54, 1.0); cr.set_line_width(2); cr.set_dash([5, 5])
-        cr.move_to(x0, y0); cr.line_to(cx1, cy1); cr.move_to(x1, y1); cr.line_to(cx2, cy2); cr.stroke()
+        blue = (0.48, 0.64, 0.97, 1.0)
+        orange = (1.0, 0.62, 0.39, 1.0)
+
+        # Out handle dotted line (Blue)
+        cr.set_source_rgba(*blue); cr.set_line_width(1.5); cr.set_dash([5, 5])
+        cr.move_to(x0, y0); cr.line_to(cx1, cy1); cr.stroke()
+
+        # In handle dotted line (Orange)
+        cr.set_source_rgba(*orange); cr.set_line_width(1.5); cr.set_dash([5, 5])
+        cr.move_to(x1, y1); cr.line_to(cx2, cy2); cr.stroke()
         cr.set_dash([])
 
+        # Main curve
         cr.set_source_rgba(0.48, 0.64, 0.97, 1.0); cr.set_line_width(4)
         cr.move_to(x0, y0); cr.curve_to(cx1, cy1, cx2, cy2, x1, y1); cr.stroke()
         cr.arc(x0, y0, 5, 0, 2 * math.pi); cr.fill(); cr.arc(x1, y1, 5, 0, 2 * math.pi); cr.fill()
 
+        # Out Handle (Blue)
         cr.set_line_width(3); cr.set_source_rgba(0.1, 0.1, 0.12, 1.0)
-        cr.arc(cx1, cy1, 7, 0, 2 * math.pi); cr.fill_preserve(); cr.set_source_rgba(0.48, 0.64, 0.97, 1.0); cr.stroke()
-        cr.set_source_rgba(0.1, 0.1, 0.12, 1.0); cr.arc(cx2, cy2, 7, 0, 2 * math.pi); cr.fill_preserve(); cr.set_source_rgba(0.48, 0.64, 0.97, 1.0); cr.stroke()
+        cr.arc(cx1, cy1, 7, 0, 2 * math.pi); cr.fill_preserve(); cr.set_source_rgba(*blue); cr.stroke()
+        
+        # In Handle (Orange)
+        cr.set_source_rgba(0.1, 0.1, 0.12, 1.0); cr.arc(cx2, cy2, 7, 0, 2 * math.pi); cr.fill_preserve(); cr.set_source_rgba(*orange); cr.stroke()
 
         if self.is_animating or self.anim_progress > 0:
             px, py = self.math_to_cairo(self.anim_progress, self.anim_eased_value, width, height)
             cr.set_source_rgba(1.0, 0.4, 0.4, 0.5); cr.set_line_width(2)
-            cr.move_to(px, py); cr.line_to(px, y0); cr.stroke()
+            cr.move_to(px, y1); cr.line_to(px, y0); cr.stroke()
             cr.set_source_rgba(1.0, 0.4, 0.4, 1.0); cr.arc(px, py, 6, 0, 2 * math.pi); cr.fill()
 
     def on_launch_effectcraft(self, button):
@@ -544,6 +706,22 @@ class BakaFlow(Gtk.Window):
             return {"ok": False}
 
     def on_apply_clicked(self, button):
+        if self.last_graph_tab == "speed":
+            s0, i0, s1, i1 = self.speed_handles()
+            ease_out = (s0, i0 * 100.0)
+            ease_in = (s1, i1 * 100.0)
+            do_in = do_out = True
+            send_missing = True
+        else:
+            in_infl = max(0.1, (1.0 - self.curve_x2) * 100.0)
+            out_infl = max(0.1, self.curve_x1 * 100.0)
+            ease_in = ((1.0 - self.curve_y2) / (in_infl / 100.0), in_infl)
+            ease_out = (self.curve_y1 / (out_infl / 100.0), out_infl)
+            do_in = do_out = True
+            send_missing = True
+        self._apply_ease(ease_in, ease_out, do_in, do_out, send_missing)
+
+    def _apply_ease(self, ease_in, ease_out, do_in, do_out, send_missing):
         info_res = self.send_ec_command("keys.info", {})
         if not info_res.get("ok"):
             self.show_success_temp("❌ Error: Could not reach EffectCraft.")
@@ -573,6 +751,9 @@ class BakaFlow(Gtk.Window):
         if y_on: checked_axes.append(1)
         if z_on: checked_axes.append(2)
 
+        in_norm, in_influence = ease_in
+        out_norm, out_influence = ease_out
+
         for (layer_id, prop_path), selected_times in targets.items():
             tail = prop_path[-1] if prop_path else ""
             is_already_separated = tail in ("X", "Y", "Z")
@@ -582,7 +763,6 @@ class BakaFlow(Gtk.Window):
                 base_res = self.send_ec_command("prop.get", {"layer": layer_id, "path": prop_path})
                 if base_res.get("ok"):
                     prop_type = base_res["result"].get("type", "scalar")
-                    all_keys = base_res["result"].get("keys", [])
 
                     if prop_type == "vec3":
                         if x_on and y_on and z_on:
@@ -624,12 +804,10 @@ class BakaFlow(Gtk.Window):
 
                     payload = {}
 
-                    if i > 0:
+                    if do_in and i > 0:
                         k_prev = all_keys[i-1]
                         D = k["time"] - k_prev["time"]
                         if D > 0.001:
-                            in_influence = max(0.1, (1.0 - self.curve_x2) * 100.0)
-
                             if isinstance(k["value"], list):
                                 num_dims = len(k["value"])
                                 in_speeds = [0.0] * num_dims
@@ -638,7 +816,7 @@ class BakaFlow(Gtk.Window):
                                     if dim in checked_axes:
                                         delta_v = k["value"][dim] - k_prev["value"][dim]
                                         if abs(delta_v) > 0.001:
-                                            in_speeds[dim] = ((1.0 - self.curve_y2) * delta_v) / (D * (in_influence / 100.0))
+                                            in_speeds[dim] = (in_norm * delta_v) / D
                                             has_movement = True
                                 if has_movement:
                                     payload["inSpeed"] = in_speeds
@@ -646,16 +824,13 @@ class BakaFlow(Gtk.Window):
                             else:
                                 delta_v = k["value"] - k_prev["value"]
                                 if abs(delta_v) > 0.001:
-                                    in_speed = ((1.0 - self.curve_y2) * delta_v) / (D * (in_influence / 100.0))
-                                    payload["inSpeed"] = in_speed
+                                    payload["inSpeed"] = (in_norm * delta_v) / D
                                     payload["inInfluence"] = in_influence
 
-                    if i < len(all_keys) - 1:
+                    if do_out and i < len(all_keys) - 1:
                         k_next = all_keys[i+1]
                         D = k_next["time"] - k["time"]
                         if D > 0.001:
-                            out_influence = max(0.1, self.curve_x1 * 100.0)
-
                             if isinstance(k["value"], list):
                                 num_dims = len(k["value"])
                                 out_speeds = [0.0] * num_dims
@@ -664,7 +839,7 @@ class BakaFlow(Gtk.Window):
                                     if dim in checked_axes:
                                         delta_v = k_next["value"][dim] - k["value"][dim]
                                         if abs(delta_v) > 0.001:
-                                            out_speeds[dim] = (self.curve_y1 * delta_v) / (D * (out_influence / 100.0))
+                                            out_speeds[dim] = (out_norm * delta_v) / D
                                             has_movement = True
                                 if has_movement:
                                     payload["outSpeed"] = out_speeds
@@ -672,47 +847,52 @@ class BakaFlow(Gtk.Window):
                             else:
                                 delta_v = k_next["value"] - k["value"]
                                 if abs(delta_v) > 0.001:
-                                    out_speed = (self.curve_y1 * delta_v) / (D * (out_influence / 100.0))
-                                    payload["outSpeed"] = out_speed
+                                    payload["outSpeed"] = (out_norm * delta_v) / D
                                     payload["outInfluence"] = out_influence
 
                     if payload:
+                        send_in = do_in and (send_missing or "inSpeed" in payload)
+                        send_out = do_out and (send_missing or "outSpeed" in payload)
                         is_sep = target_path and target_path[-1] in ("X", "Y", "Z")
                         if isinstance(k["value"], list) and not is_sep:
                             num_dims = len(k["value"])
                             for d in checked_axes:
-                                if d >= num_dims:
-                                    continue
-                                speed_in = payload.get("inSpeed", 0.0)
-                                if isinstance(speed_in, list): speed_in = speed_in[d]
-                                speed_out = payload.get("outSpeed", 0.0)
-                                if isinstance(speed_out, list): speed_out = speed_out[d]
+                                if d >= num_dims: continue
+                                if send_in:
+                                    speed_in = payload.get("inSpeed", 0.0)
+                                    if isinstance(speed_in, list): speed_in = speed_in[d]
+                                    self.send_ec_command("keys.setEase", {
+                                        "layer": layer_id, "path": target_path,
+                                        "time": k["time"], "side": "in", "dim": d,
+                                        "speed": speed_in,
+                                        "influence": payload.get("inInfluence", 33.3)
+                                    })
+                                if send_out:
+                                    speed_out = payload.get("outSpeed", 0.0)
+                                    if isinstance(speed_out, list): speed_out = speed_out[d]
+                                    self.send_ec_command("keys.setEase", {
+                                        "layer": layer_id, "path": target_path,
+                                        "time": k["time"], "side": "out", "dim": d,
+                                        "speed": speed_out,
+                                        "influence": payload.get("outInfluence", 33.3)
+                                    })
+                        else:
+                            if send_in:
                                 self.send_ec_command("keys.setEase", {
                                     "layer": layer_id, "path": target_path,
-                                    "time": k["time"], "side": "in", "dim": d,
-                                    "speed": speed_in,
+                                    "time": k["time"], "side": "in", "dim": 0,
+                                    "speed": payload.get("inSpeed", 0.0),
                                     "influence": payload.get("inInfluence", 33.3)
                                 })
+                            if send_out:
                                 self.send_ec_command("keys.setEase", {
                                     "layer": layer_id, "path": target_path,
-                                    "time": k["time"], "side": "out", "dim": d,
-                                    "speed": speed_out,
+                                    "time": k["time"], "side": "out", "dim": 0,
+                                    "speed": payload.get("outSpeed", 0.0),
                                     "influence": payload.get("outInfluence", 33.3)
                                 })
-                        else:
-                            self.send_ec_command("keys.setEase", {
-                                "layer": layer_id, "path": target_path,
-                                "time": k["time"], "side": "in", "dim": 0,
-                                "speed": payload.get("inSpeed", 0.0),
-                                "influence": payload.get("inInfluence", 33.3)
-                            })
-                            self.send_ec_command("keys.setEase", {
-                                "layer": layer_id, "path": target_path,
-                                "time": k["time"], "side": "out", "dim": 0,
-                                "speed": payload.get("outSpeed", 0.0),
-                                "influence": payload.get("outInfluence", 33.3)
-                            })
-                        applied_count += 1
+                        if send_in or send_out:
+                            applied_count += 1
 
         if original_selection:
             self.send_ec_command("keys.select", {"keys": original_selection})
@@ -720,7 +900,7 @@ class BakaFlow(Gtk.Window):
         if applied_count > 0:
             self.show_success_temp(f"✅ Success! Applied to {applied_count} keyframe(s).")
         else:
-            self.show_success_temp(f"❌ Error: {last_error}")
+            self.show_success_temp(f"❌ Error: {last_error or 'nothing to ease (need 2+ keys with movement).'}")
 
     def on_export_clicked(self, button):
         dialog = Gtk.FileChooserDialog(title="Export Presets", parent=self, action=Gtk.FileChooserAction.SAVE)
@@ -770,6 +950,7 @@ class BakaFlow(Gtk.Window):
         except Exception: pass
 
     def refresh_saved_list(self):
+        if hasattr(self, "speed_preset_listbox"): self.refresh_speed_presets()
         for row in self.saved_listbox.get_children(): self.saved_listbox.remove(row)
         for name in self.custom_presets.keys():
             row = Gtk.ListBoxRow()
@@ -840,11 +1021,17 @@ class BakaFlow(Gtk.Window):
         if preset_name in self.custom_presets:
             x1, y1, x2, y2 = self.custom_presets[preset_name]
             self.curve_x1, self.curve_y1 = x1, y1; self.curve_x2, self.curve_y2 = x2, y2
-            self.update_entries(); self.update_css_entry(); self.graph_area.queue_draw()
-            self.stack.set_visible_child_name("easing"); self.on_tab_clicked(None, "easing")
+            self.speed_preset_listbox.unselect_all()
+            self.update_entries(); self.update_css_entry(); self._on_curve_changed()
+            self.on_tab_clicked(None, self.last_graph_tab)
 
     def on_tab_clicked(self, button, page_name):
         self.stack.set_visible_child_name(page_name)
+        if page_name in ("easing", "speed"):
+            self.last_graph_tab = page_name
+            self.btn_apply.set_label("APPLY SPEED" if page_name == "speed" else "APPLY VALUE")
+            if page_name == "speed":
+                self.fit_speed_view(); self.update_speed_info(); self.speed_graph.queue_draw()
         for name, btn in self.tab_buttons.items():
             if name == page_name: btn.get_style_context().add_class("active")
             else: btn.get_style_context().remove_class("active")
@@ -854,15 +1041,16 @@ class BakaFlow(Gtk.Window):
 
     def update_css_entry(self):
         self.css_entry.set_text(self.get_css_string())
+        if hasattr(self, "s_css_entry"): self.s_css_entry.set_text(self.get_css_string())
 
     def on_reset_clicked(self, button):
         self.curve_x1, self.curve_y1 = self.default_x1, self.default_y1
         self.curve_x2, self.curve_y2 = self.default_x2, self.default_y2
-        self.preset_listbox.unselect_all(); self.saved_listbox.unselect_all()
-        self.update_entries(); self.update_css_entry(); self.graph_area.queue_draw()
+        self._unselect_presets()
+        self.update_entries(); self.update_css_entry(); self._on_curve_changed()
 
     def on_css_clicked(self, widget, event):
-        self.css_entry.select_region(0, -1)
+        widget.select_region(0, -1)
         clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
         clipboard.set_text(self.get_css_string(), -1)
         return False
@@ -900,9 +1088,20 @@ class BakaFlow(Gtk.Window):
         elif math.hypot(event.x - cx2, event.y - cy2) < 15: self.dragging_handle = 2
         elif self.dist_to_segment(event.x, event.y, x0, y0, cx1, cy1) < 10: self.dragging_handle = 1
         elif self.dist_to_segment(event.x, event.y, x1, y1, cx2, cy2) < 10: self.dragging_handle = 2
+        else:
+            # Check if inside the graph box to scrub
+            if x0 <= event.x <= x1 and y1 <= event.y <= y0:
+                self.is_scrubbing = True
+                mx, _ = self.cairo_to_math(event.x, event.y, width, height)
+                self.set_progress(mx)
         return True
 
     def on_motion_notify(self, widget, event):
+        if self.is_scrubbing:
+            width = widget.get_allocated_width(); height = widget.get_allocated_height()
+            mx, _ = self.cairo_to_math(event.x, event.y, width, height)
+            self.set_progress(mx)
+            return True
         if not self.dragging_handle: return False
         width = widget.get_allocated_width(); height = widget.get_allocated_height()
         mx, my = self.cairo_to_math(event.x, event.y, width, height)
@@ -919,17 +1118,23 @@ class BakaFlow(Gtk.Window):
         else: self.curve_x2, self.curve_y2 = mx, my
 
         self.update_entries(); self.update_css_entry()
-        self.preset_listbox.unselect_all(); self.saved_listbox.unselect_all()
-        widget.queue_draw(); self.preview_area.queue_draw()
+        self._unselect_presets()
+        self._on_curve_changed()
         return True
 
     def on_button_release(self, widget, event):
-        self.dragging_handle = None; return True
+        self.dragging_handle = None
+        self.is_scrubbing = False
+        return True
 
     def update_entries(self):
         self.is_updating_entries = True
         self.entries["x1"].set_text(f"{self.curve_x1:.2f}"); self.entries["y1"].set_text(f"{self.curve_y1:.2f}")
         self.entries["x2"].set_text(f"{self.curve_x2:.2f}"); self.entries["y2"].set_text(f"{self.curve_y2:.2f}")
+        if hasattr(self, "sentries"):
+            s0, i0, s1, i1 = self.speed_handles()
+            self.sentries["os"].set_text(fmt_num(s0)); self.sentries["oi"].set_text(f"{i0 * 100:.1f}")
+            self.sentries["is"].set_text(fmt_num(s1)); self.sentries["ii"].set_text(f"{i1 * 100:.1f}")
         self.is_updating_entries = False
 
     def on_entry_changed(self, entry, key):
@@ -942,8 +1147,8 @@ class BakaFlow(Gtk.Window):
             elif key == "y2": self.curve_y2 = val
             entry.set_text(f"{getattr(self, 'curve_' + key):.2f}")
             self.update_css_entry()
-            self.preset_listbox.unselect_all(); self.saved_listbox.unselect_all()
-            self.graph_area.queue_draw(); self.preview_area.queue_draw()
+            self._unselect_presets()
+            self._on_curve_changed()
         except ValueError:
             self.update_entries()
 
@@ -953,9 +1158,10 @@ class BakaFlow(Gtk.Window):
         if not preset_name: return
         if preset_name in BUILTIN_PRESETS:
             x1, y1, x2, y2 = BUILTIN_PRESETS[preset_name]
+            self.speed_preset_listbox.unselect_all()
             self.curve_x1, self.curve_y1 = x1, y1; self.curve_x2, self.curve_y2 = x2, y2
             self.update_entries(); self.update_css_entry()
-            self.graph_area.queue_draw(); self.preview_area.queue_draw()
+            self._on_curve_changed()
 
     def on_search_changed(self, entry):
         search_text = entry.get_text().lower()
@@ -964,6 +1170,439 @@ class BakaFlow(Gtk.Window):
             name = getattr(row, 'preset_name', "")
             return search_text in name.lower()
         self.preset_listbox.set_filter_func(filter_func)
+
+    def _link_checks(self, a, b):
+        def on_a(w):
+            if b.get_active() != w.get_active(): b.set_active(w.get_active())
+        def on_b(w):
+            if a.get_active() != w.get_active(): a.set_active(w.get_active())
+        a.connect("toggled", on_a); b.connect("toggled", on_b)
+
+    def build_speed_page(self):
+        page = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        left.set_margin_top(4); left.set_margin_bottom(4)
+        left.set_margin_start(4); left.set_margin_end(4)
+
+        self.speed_graph = Gtk.DrawingArea()
+        self.speed_graph.set_size_request(-1, 82)
+        self.speed_graph.get_style_context().add_class("graph-bg")
+        self.speed_graph.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.SCROLL_MASK)
+        self.speed_graph.connect("draw", self.on_draw_speed)
+        self.speed_graph.connect("button-press-event", self.on_s_press)
+        self.speed_graph.connect("button-release-event", self.on_s_release)
+        self.speed_graph.connect("motion-notify-event", self.on_s_motion)
+        self.speed_graph.connect("scroll-event", self.on_s_scroll)
+        self.speed_graph.set_tooltip_text("Drag a handle: up/down = speed, left/right = influence.\nShift = lock speed at 0 · Ctrl = mirror In/Out · Scroll = zoom speed axis")
+        left.pack_start(self.speed_graph, True, True, 0)
+
+        preview_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        self.speed_preview = Gtk.DrawingArea()
+        self.speed_preview.get_style_context().add_class("preview-bg")
+        self.speed_preview.set_size_request(-1, 18)
+        self.speed_preview.connect("draw", self.on_draw_speed_preview)
+        preview_box.pack_start(self.speed_preview, True, True, 0)
+
+        duration_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        duration_lbl = Gtk.Label(label="Sec:")
+        duration_lbl.get_style_context().add_class("status-text")
+        spin = Gtk.SpinButton(adjustment=self.duration_adj, climb_rate=1.0, digits=1)
+        spin.set_width_chars(2)
+        duration_box.pack_start(duration_lbl, False, False, 0)
+        duration_box.pack_start(spin, False, False, 0)
+        preview_box.pack_start(duration_box, False, False, 0)
+
+        self.val_play_btn = Gtk.Button(label="▶")
+        self.val_play_btn.get_style_context().add_class("btn-secondary")
+        self.val_play_btn.connect("clicked", self.on_play_pause)
+        preview_box.pack_start(self.val_play_btn, False, False, 0)
+        left.pack_start(preview_box, False, False, 0)
+
+        info_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        self.speed_info = Gtk.Label(label="")
+        self.speed_info.set_xalign(0)
+        self.speed_info.set_ellipsize(Pango.EllipsizeMode.END)
+        self.speed_info.get_style_context().add_class("status-text")
+        info_row.pack_start(self.speed_info, True, True, 0)
+        left.pack_start(info_row, False, False, 0)
+
+        inputs_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        self.sentries = {}
+        for key, label in [("os", "OUT SPD"), ("oi", "OUT INF%"), ("is", "IN SPD"), ("ii", "IN INF%")]:
+            vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            lbl = Gtk.Label(label=label)
+            lbl.set_xalign(0); lbl.get_style_context().add_class("status-text")
+            entry = Gtk.Entry()
+            entry.set_width_chars(3); entry.get_style_context().add_class("entry-field")
+            entry.connect("activate", self.on_s_entry_changed, key)
+            entry.connect("focus-out-event", self.on_s_entry_focus_out, key)
+            vbox.pack_start(lbl, False, False, 0); vbox.pack_start(entry, False, False, 0)
+            inputs_box.pack_start(vbox, True, True, 0)
+            self.sentries[key] = entry
+        left.pack_start(inputs_box, False, False, 0)
+
+        self.s_css_entry = Gtk.Entry()
+        self.s_css_entry.set_text(self.get_css_string())
+        self.s_css_entry.set_editable(False)
+        self.s_css_entry.get_style_context().add_class("css-string")
+        self.s_css_entry.connect("button-press-event", self.on_css_clicked)
+        left.pack_start(self.s_css_entry, False, False, 0)
+
+        check_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        self.no_over_check = Gtk.CheckButton(label="Lock Handles")
+        self.no_over_check.set_tooltip_text("Keep handles inside the graph box")
+        self.s_snap_check = Gtk.CheckButton(label="Snap 0.1 · 5%")
+        self.mirror_check = Gtk.CheckButton(label="Mirror")
+        self.mirror_check.set_tooltip_text("In handle = Out handle (symmetric ease). Hold Ctrl while dragging for the same.")
+        self._link_checks(self.no_over_check, self.lock_bounds_check)
+        for c in (self.no_over_check, self.s_snap_check, self.mirror_check):
+            check_box.pack_start(c, False, False, 0)
+        left.pack_start(check_box, False, False, 0)
+
+        apply_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        axes_lbl = Gtk.Label(label="Apply to Axes:")
+        axes_lbl.get_style_context().add_class("status-text")
+        self.s_axis_x = Gtk.CheckButton(label="X"); self.s_axis_y = Gtk.CheckButton(label="Y"); self.s_axis_z = Gtk.CheckButton(label="Z")
+        for c in (self.s_axis_x, self.s_axis_y, self.s_axis_z): c.set_active(True)
+        self._link_checks(self.s_axis_x, self.axis_x)
+        self._link_checks(self.s_axis_y, self.axis_y)
+        self._link_checks(self.s_axis_z, self.axis_z)
+        for w in (axes_lbl, self.s_axis_x, self.s_axis_y, self.s_axis_z):
+            apply_box.pack_start(w, False, False, 0)
+        left.pack_start(apply_box, False, False, 0)
+
+        launch_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        launch_lbl = Gtk.Label(label="Need a safe start?")
+        launch_lbl.get_style_context().add_class("status-text")
+        launch_btn = Gtk.Button(label="Launch EffectCraft")
+        launch_btn.get_style_context().add_class("btn-secondary")
+        launch_btn.connect("clicked", self.on_launch_effectcraft)
+        launch_box.pack_start(launch_lbl, False, False, 0)
+        launch_box.pack_start(launch_btn, False, False, 0)
+        left.pack_start(launch_box, False, False, 0)
+
+        page.pack1(left, True, False)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.speed_search = Gtk.SearchEntry()
+        self.speed_search.set_margin_top(4); self.speed_search.set_margin_bottom(4)
+        self.speed_search.set_margin_start(4); self.speed_search.set_margin_end(4)
+        self.speed_search.set_placeholder_text("Search presets...")
+        self.speed_search.connect("search-changed", self.on_s_search_changed)
+        right.pack_start(self.speed_search, False, False, 0)
+        scroll = Gtk.ScrolledWindow()
+        self.speed_preset_listbox = Gtk.ListBox()
+        self.speed_preset_listbox.get_style_context().add_class("preset-list")
+        self.speed_preset_listbox.connect("row-selected", self.on_speed_preset_selected)
+        scroll.add(self.speed_preset_listbox)
+        right.pack_start(scroll, True, True, 0)
+        page.pack2(right, True, False)
+        return page
+
+    def speed_handles(self):
+        return bezier_to_speed(self.curve_x1, self.curve_y1, self.curve_x2, self.curve_y2)
+
+    def _queue_all(self):
+        self.graph_area.queue_draw(); self.preview_area.queue_draw()
+        self.speed_graph.queue_draw(); self.speed_preview.queue_draw()
+
+    def _on_curve_changed(self, fit=True):
+        if fit and self.dragging_speed_handle is None:
+            self.fit_speed_view()
+        self.update_speed_info()
+        self._queue_all()
+
+    def _unselect_presets(self):
+        self.preset_listbox.unselect_all(); self.saved_listbox.unselect_all()
+        self.speed_preset_listbox.unselect_all()
+
+    def refresh_speed_presets(self):
+        lb = self.speed_preset_listbox
+        for row in lb.get_children(): lb.remove(row)
+        for name, c in self.custom_presets.items():
+            if isinstance(c, list) and len(c) == 4:
+                lb.add(SpeedPresetRow("★ " + name, c))
+        for name, c in SPEED_PRESETS.items(): lb.add(SpeedPresetRow(name, c))
+        for name, c in BUILTIN_PRESETS.items(): lb.add(SpeedPresetRow(name, c))
+        lb.show_all()
+
+    def on_speed_preset_selected(self, listbox, row):
+        bez = getattr(row, "bez", None)
+        if row is None or not bez: return
+        self.curve_x1, self.curve_y1, self.curve_x2, self.curve_y2 = bez
+        self.preset_listbox.unselect_all(); self.saved_listbox.unselect_all()
+        self.update_entries(); self.update_css_entry(); self._on_curve_changed()
+
+    def on_s_search_changed(self, entry):
+        text = entry.get_text().lower()
+        def filter_func(row):
+            if row is None: return False
+            return text in getattr(row, "preset_name", "").lower()
+        self.speed_preset_listbox.set_filter_func(filter_func)
+
+    def set_curve_from_speed(self, out=None, inn=None):
+        if out is not None:
+            s0, i0 = out
+            self.curve_x1 = min(1.0, max(MIN_INFL, i0)); self.curve_y1 = s0 * self.curve_x1
+        if inn is not None:
+            s1, i1 = inn
+            i1 = min(1.0, max(MIN_INFL, i1))
+            self.curve_x2 = 1.0 - i1; self.curve_y2 = 1.0 - s1 * i1
+        if self.no_over_check.get_active():
+            self.curve_y1 = min(1.0, max(0.0, self.curve_y1))
+            self.curve_y2 = min(1.0, max(0.0, self.curve_y2))
+
+    def fit_speed_view(self):
+        pts = speed_curve(self.curve_x1, self.curve_y1, self.curve_x2, self.curve_y2, 80)
+        ss = [s for _, s in pts]
+        s0, _, s1, _ = self.speed_handles()
+        ss += [min(max(s0, -8.0), 15.0), min(max(s1, -8.0), 15.0)]
+        top = min(15.0, max(ss + [1.0]) * 1.15)
+        low = max(-8.0, min(ss + [0.0]) * 1.15)
+        if top - low < 1.5: top = low + 1.5
+        span = top - low
+        self.s_ymin = (low if low < 0 else 0.0) - 0.08 * span
+        self.s_ymax = top
+
+    def on_fit_clicked(self, button):
+        self.fit_speed_view(); self.update_speed_info(); self.speed_graph.queue_draw()
+
+    def update_speed_info(self):
+        if not hasattr(self, "speed_info"): return
+        c = (self.curve_x1, self.curve_y1, self.curve_x2, self.curve_y2)
+        if self.is_animating:
+            t = self.anim_progress
+            txt = f"t {t:.2f}  ·  speed {speed_at_time(t, *c):.2f}×  ·  value {self.anim_eased_value:.2f}"
+        else:
+            pk_t, pk = max(speed_curve(*c, n=60), key=lambda p: p[1])
+            lo, hi = curve_extent(*c)
+            over = max(hi - 1.0, -lo, 0.0)
+            pk_txt = f"{pk:.2f}×" if pk < 100 else ">100×"
+            ov_txt = "no overshoot" if over < 0.005 else f"overshoot {over * 100:.0f}%"
+            txt = f"peak {pk_txt} @ t {pk_t:.2f}  ·  {ov_txt}"
+        self.speed_info.set_text(txt)
+
+    def s_rect(self, w, h):
+        return self.s_ml, self.s_mt, w - self.s_mr, h - self.s_mb
+
+    def s_to_px(self, t, s, w, h):
+        L, T, R, B = self.s_rect(w, h)
+        return L + t * (R - L), B - (s - self.s_ymin) / (self.s_ymax - self.s_ymin) * (B - T)
+
+    def s_from_px(self, px, py, w, h):
+        L, T, R, B = self.s_rect(w, h)
+        return (px - L) / (R - L), self.s_ymin + (B - py) / (B - T) * (self.s_ymax - self.s_ymin)
+
+    def _handle_px(self, w, h):
+        L, T, R, B = self.s_rect(w, h)
+        s0, i0, s1, i1 = self.speed_handles()
+        _, oy = self.s_to_px(0, s0, w, h); _, iy = self.s_to_px(1, s1, w, h)
+        oy = min(max(oy, T + 1), B - 1); iy = min(max(iy, T + 1), B - 1)
+        ox = L + i0 * (R - L); ix = L + (1.0 - i1) * (R - L)
+        return (L, oy, ox), (R, iy, ix)
+
+    def on_draw_speed(self, widget, cr):
+        w = widget.get_allocated_width(); h = widget.get_allocated_height()
+        L, T, R, B = self.s_rect(w, h)
+        if R - L < 10 or B - T < 10: return
+        c = (self.curve_x1, self.curve_y1, self.curve_x2, self.curve_y2)
+        X = lambda t: L + t * (R - L)
+        Y = lambda s: B - (s - self.s_ymin) / (self.s_ymax - self.s_ymin) * (B - T)
+        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(9)
+
+        step = nice_step(self.s_ymax - self.s_ymin)
+        n0 = math.ceil(self.s_ymin / step); n1 = math.floor(self.s_ymax / step)
+        for n in range(n0, min(n1, n0 + 14) + 1):
+            v = n * step; y = Y(v)
+            cr.set_line_width(1)
+            cr.set_source_rgba(0.3, 0.35, 0.5, 1.0) if n == 0 else cr.set_source_rgba(0.16, 0.18, 0.25, 1.0)
+            cr.move_to(L, y); cr.line_to(R, y); cr.stroke()
+            txt = fmt_num(v)
+            cr.set_source_rgba(0.34, 0.37, 0.54, 1.0)
+            cr.move_to(L - 6 - cr.text_extents(txt).width, y + 3); cr.show_text(txt)
+        cr.set_line_width(1); cr.set_source_rgba(0.16, 0.18, 0.25, 1.0)
+        for i in range(1, 4):
+            cr.move_to(X(i / 4.0), T); cr.line_to(X(i / 4.0), B)
+        cr.stroke()
+        cr.set_source_rgba(0.25, 0.28, 0.4, 1.0); cr.set_line_width(1.5)
+        cr.rectangle(L, T, R - L, B - T); cr.stroke()
+        if self.s_ymin <= 1.0 <= self.s_ymax:
+            cr.set_source_rgba(0.62, 0.81, 0.42, 0.7); cr.set_line_width(1); cr.set_dash([4, 4])
+            cr.move_to(L, Y(1.0)); cr.line_to(R, Y(1.0)); cr.stroke(); cr.set_dash([])
+            cr.set_font_size(8)
+            cr.move_to(R - 4 - cr.text_extents("avg").width, Y(1.0) - 3); cr.show_text("avg")
+            cr.set_font_size(9)
+
+        pts = speed_curve(*c, n=96)
+        playing = self.is_animating or self.anim_progress > 0
+        cr.save()
+        cr.rectangle(L, T, R - L, B - T); cr.clip()
+        y0 = min(max(Y(0.0), T), B)
+        cr.move_to(X(pts[0][0]), y0)
+        for t, s in pts: cr.line_to(X(t), Y(s))
+        cr.line_to(X(pts[-1][0]), y0); cr.close_path()
+        cr.set_source_rgba(0.48, 0.64, 0.97, 0.13); cr.fill()
+        if playing:
+            prog = self.anim_progress
+            part = [p for p in pts if p[0] <= prog] + [(prog, speed_at_time(prog, *c))]
+            cr.move_to(X(0.0), y0)
+            for t, s in part: cr.line_to(X(t), Y(s))
+            cr.line_to(X(prog), y0); cr.close_path()
+            cr.set_source_rgba(1.0, 0.4, 0.4, 0.18); cr.fill()
+        cr.set_source_rgba(0.48, 0.64, 0.97, 1.0); cr.set_line_width(3)
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        cr.move_to(X(pts[0][0]), Y(pts[0][1]))
+        for t, s in pts[1:]: cr.line_to(X(t), Y(s))
+        cr.stroke()
+        cr.restore()
+
+        blue = (0.48, 0.64, 0.97, 1.0); orange = (1.0, 0.62, 0.39, 1.0)
+        (kx0, oy, ox), (kx1, iy, ix) = self._handle_px(w, h)
+        cr.set_source_rgba(0.34, 0.37, 0.54, 1.0); cr.set_line_width(1.5); cr.set_dash([4, 4])
+        cr.move_to(kx0, oy); cr.line_to(ox, oy); cr.move_to(kx1, iy); cr.line_to(ix, iy); cr.stroke()
+        cr.set_dash([])
+        for kx, ky, col in ((kx0, oy, blue), (kx1, iy, orange)):
+            cr.set_source_rgba(*col); cr.rectangle(kx - 4, ky - 4, 8, 8); cr.fill()
+        for hx, hy, col in ((ox, oy, blue), (ix, iy, orange)):
+            cr.set_line_width(3); cr.set_source_rgba(0.1, 0.1, 0.12, 1.0)
+            cr.arc(hx, hy, 7, 0, 2 * math.pi); cr.fill_preserve()
+            cr.set_source_rgba(*col); cr.stroke()
+
+        if playing:
+            prog = self.anim_progress
+            px = X(prog); py = min(max(Y(speed_at_time(prog, *c)), T), B)
+            cr.set_source_rgba(1.0, 0.4, 0.4, 0.5); cr.set_line_width(2)
+            cr.move_to(px, B); cr.line_to(px, T); cr.stroke()
+            cr.set_source_rgba(1.0, 0.4, 0.4, 1.0); cr.arc(px, py, 5, 0, 2 * math.pi); cr.fill()
+
+    def on_draw_speed_preview(self, widget, cr):
+        width = widget.get_allocated_width(); height = widget.get_allocated_height()
+        track_y = height / 2.0
+        cr.set_source_rgba(0.25, 0.28, 0.4, 1.0); cr.set_line_width(2)
+        cr.move_to(10, track_y); cr.line_to(width - 10, track_y); cr.stroke()
+        if self.is_animating or self.anim_progress > 0:
+            cx = 10 + self.anim_eased_value * (width - 20)
+            sp = speed_at_time(self.anim_progress, self.curve_x1, self.curve_y1, self.curve_x2, self.curve_y2)
+            trail = max(-30.0, min(70.0, sp * 10.0))
+            tx = min(max(cx - trail, 2), width - 2)
+            cr.set_source_rgba(0.48, 0.64, 0.97, 0.35); cr.set_line_width(6); cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.move_to(tx, track_y); cr.line_to(cx, track_y); cr.stroke()
+            cr.set_source_rgba(0.48, 0.64, 0.97, 1.0)
+            cr.rectangle(cx - 5, track_y - 5, 10, 10); cr.fill()
+
+    def on_s_press(self, widget, event):
+        w = widget.get_allocated_width(); h = widget.get_allocated_height()
+        (kx0, oy, ox), (kx1, iy, ix) = self._handle_px(w, h)
+        d_out = math.hypot(event.x - ox, event.y - oy)
+        d_in = math.hypot(event.x - ix, event.y - iy)
+        pick = None
+        if min(d_out, d_in) < 15:
+            pick = "out" if d_out <= d_in else "in"
+        else:
+            s_out = self.dist_to_segment(event.x, event.y, kx0, oy, ox, oy)
+            s_in = self.dist_to_segment(event.x, event.y, kx1, iy, ix, iy)
+            if min(s_out, s_in) < 8:
+                pick = "out" if s_out <= s_in else "in"
+            else:
+                L, T, R, B = self.s_rect(w, h)
+                if L <= event.x <= R and T <= event.y <= B:
+                    self.is_scrubbing = True
+                    t, _ = self.s_from_px(event.x, event.y, w, h)
+                    self.set_progress(t)
+        self.dragging_speed_handle = pick
+        return True
+
+    def on_s_motion(self, widget, event):
+        if self.is_scrubbing:
+            w = widget.get_allocated_width(); h = widget.get_allocated_height()
+            t, _ = self.s_from_px(event.x, event.y, w, h)
+            self.set_progress(t)
+            return True
+        side = self.dragging_speed_handle
+        if not side: return False
+        w = widget.get_allocated_width(); h = widget.get_allocated_height()
+        
+        # Lock handles to graph boundaries
+        if self.lock_bounds_check.get_active():
+            L, T, R, B = self.s_rect(w, h)
+            ex = min(max(event.x, L), R)
+            ey = min(max(event.y, T), B)
+            t, s = self.s_from_px(ex, ey, w, h)
+        else:
+            t, s = self.s_from_px(event.x, event.y, w, h)
+
+        shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+        infl = t if side == "out" else 1.0 - t
+        infl = min(1.0, max(MIN_INFL, infl))
+        if shift: s = 0.0
+        if self.s_snap_check.get_active():
+            s = round(s * 10) / 10.0
+            infl = min(1.0, max(MIN_INFL, round(infl * 20) / 20.0))
+        
+        pair = (s, infl)
+        mirror = ctrl or self.mirror_check.get_active()
+        if side == "out":
+            self.set_curve_from_speed(out=pair, inn=pair if mirror else None)
+        else:
+            self.set_curve_from_speed(inn=pair, out=pair if mirror else None)
+        self.update_entries(); self.update_css_entry()
+        self._unselect_presets()
+        self._on_curve_changed(fit=False)
+        return True
+
+    def on_s_release(self, widget, event):
+        self.dragging_speed_handle = None
+        self.is_scrubbing = False
+        self.fit_speed_view(); self.update_speed_info(); self._queue_all()
+        return True
+
+    def on_s_scroll(self, widget, event):
+        w = widget.get_allocated_width(); h = widget.get_allocated_height()
+        if event.direction == Gdk.ScrollDirection.UP: f = 1.1
+        elif event.direction == Gdk.ScrollDirection.DOWN: f = 1 / 1.1
+        elif event.direction == Gdk.ScrollDirection.SMOOTH:
+            ok, _dx, dy = event.get_scroll_deltas()
+            f = 1.1 if dy < 0 else 1 / 1.1
+        else:
+            return False
+        _, sm = self.s_from_px(event.x, event.y, w, h)
+        lo = sm - (sm - self.s_ymin) / f; hi = sm + (self.s_ymax - sm) / f
+        if 0.2 <= hi - lo <= 400:
+            self.s_ymin, self.s_ymax = lo, hi
+        widget.queue_draw()
+        return True
+
+    def on_s_entry_focus_out(self, entry, event, key):
+        self.on_s_entry_changed(entry, key)
+        return False
+
+    def on_s_entry_changed(self, entry, key):
+        if self.is_updating_entries: return
+        try:
+            val = float(entry.get_text())
+        except ValueError:
+            self.update_entries(); return
+        s0, i0, s1, i1 = self.speed_handles()
+        shown = {"os": s0, "oi": i0 * 100.0, "is": s1, "ii": i1 * 100.0}[key]
+        if abs(val - shown) < (0.006 if key in ("os", "is") else 0.06):
+            self.update_entries(); return
+        if key == "os": s0 = val
+        elif key == "oi": i0 = min(1.0, max(MIN_INFL, val / 100.0))
+        elif key == "is": s1 = val
+        elif key == "ii": i1 = min(1.0, max(MIN_INFL, val / 100.0))
+        mirror = self.mirror_check.get_active()
+        if key in ("os", "oi"):
+            out = (s0, i0); inn = (s0, i0) if mirror else None
+        else:
+            inn = (s1, i1); out = (s1, i1) if mirror else None
+        before = (self.curve_x1, self.curve_y1, self.curve_x2, self.curve_y2)
+        self.set_curve_from_speed(out=out, inn=inn)
+        self.update_entries(); self.update_css_entry()
+        if before != (self.curve_x1, self.curve_y1, self.curve_x2, self.curve_y2):
+            self._unselect_presets()
+            self._on_curve_changed()
 
 if __name__ == '__main__':
     win = BakaFlow()
