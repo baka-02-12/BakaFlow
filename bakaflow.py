@@ -259,6 +259,7 @@ class BakaFlow(Gtk.Window):
         self.anim_eased_value = 0.0
         self.anim_source_id = None
         self.is_animating = False
+        self._msg_timer = None
 
         self.last_graph_tab = "easing"
         self.dragging_speed_handle = None
@@ -677,11 +678,14 @@ class BakaFlow(Gtk.Window):
         self.is_showing_success = True
         self.status_label.set_text(msg)
         self.last_status_text = msg
-        GLib.timeout_add_seconds(3, self.end_success_msg)
+        if self._msg_timer:
+            GLib.source_remove(self._msg_timer)
+        self._msg_timer = GLib.timeout_add_seconds(3, self.end_success_msg)
 
     def end_success_msg(self):
         self.is_showing_success = False
         self.status_label.set_text("Ready")
+        self._msg_timer = None
         return False
 
     def send_ec_command(self, cmd_name, params, is_top_level=False):
@@ -1089,7 +1093,6 @@ class BakaFlow(Gtk.Window):
         elif self.dist_to_segment(event.x, event.y, x0, y0, cx1, cy1) < 10: self.dragging_handle = 1
         elif self.dist_to_segment(event.x, event.y, x1, y1, cx2, cy2) < 10: self.dragging_handle = 2
         else:
-            # Check if inside the graph box to scrub
             if x0 <= event.x <= x1 and y1 <= event.y <= y0:
                 self.is_scrubbing = True
                 mx, _ = self.cairo_to_math(event.x, event.y, width, height)
@@ -1119,12 +1122,16 @@ class BakaFlow(Gtk.Window):
 
         self.update_entries(); self.update_css_entry()
         self._unselect_presets()
-        self._on_curve_changed()
+        # Do NOT fit the hidden speed graph while dragging (saves CPU)
+        self._on_curve_changed(fit=False)
         return True
 
     def on_button_release(self, widget, event):
         self.dragging_handle = None
         self.is_scrubbing = False
+        # Once you let go, fit the speed graph and update the screen
+        self.fit_speed_view()
+        self._queue_all()
         return True
 
     def update_entries(self):
@@ -1212,10 +1219,10 @@ class BakaFlow(Gtk.Window):
         duration_box.pack_start(spin, False, False, 0)
         preview_box.pack_start(duration_box, False, False, 0)
 
-        self.val_play_btn = Gtk.Button(label="▶")
-        self.val_play_btn.get_style_context().add_class("btn-secondary")
-        self.val_play_btn.connect("clicked", self.on_play_pause)
-        preview_box.pack_start(self.val_play_btn, False, False, 0)
+        self.speed_play_btn = Gtk.Button(label="▶")
+        self.speed_play_btn.get_style_context().add_class("btn-secondary")
+        self.speed_play_btn.connect("clicked", self.on_play_pause)
+        preview_box.pack_start(self.speed_play_btn, False, False, 0)
         left.pack_start(preview_box, False, False, 0)
 
         info_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
@@ -1363,9 +1370,6 @@ class BakaFlow(Gtk.Window):
         span = top - low
         self.s_ymin = (low if low < 0 else 0.0) - 0.08 * span
         self.s_ymax = top
-
-    def on_fit_clicked(self, button):
-        self.fit_speed_view(); self.update_speed_info(); self.speed_graph.queue_draw()
 
     def update_speed_info(self):
         if not hasattr(self, "speed_info"): return
